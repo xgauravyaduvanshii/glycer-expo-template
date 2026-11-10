@@ -19,4 +19,19 @@ fi
 cd "$PROJECT_DIR"
 PORT="${PORT:-3000}"
 export PORT
+
+# The sandbox image boots a dev server already (startup.sh keeps one running with an
+# auto-restart loop). A second instance loses the port race and buries the real error, so
+# hand the request back to the instance that is already serving.
+if node -e "
+const net = require('net');
+const socket = net.connect(process.env.PORT, '127.0.0.1');
+socket.on('connect', () => { socket.end(); process.exit(0); });
+socket.on('error', () => process.exit(1));
+socket.setTimeout(1500, () => { socket.destroy(); process.exit(1); });
+"; then
+  echo "Dev server is already listening on port ${PORT} - reusing it."
+  exit 0
+fi
+
 exec node scripts/start-tunnel.mjs "$@"

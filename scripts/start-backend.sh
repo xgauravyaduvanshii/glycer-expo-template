@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start backend server with auto-restart on crash
-# Logs are saved to /vibe0/backend_logs.txt
+# Logs are saved to /glycer/backend_logs.txt
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"

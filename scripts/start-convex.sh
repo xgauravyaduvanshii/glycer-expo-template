@@ -1,6 +1,6 @@
 #!/bin/bash
 # Start Convex in agent mode with dashboard and API proxy
-# Logs are saved to /vibe0/convex_logs.txt
+# Logs are saved to /glycer/convex_logs.txt
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -53,7 +53,7 @@ echo "Dashboard:    https://6790-${PROJECT_ID}.e2b.app" | tee -a "$LOG_FILE"
 echo "Backend API:  https://3210-${PROJECT_ID}.e2b.app" | tee -a "$LOG_FILE"
 echo "HTTP Actions: https://3211-${PROJECT_ID}.e2b.app" | tee -a "$LOG_FILE"
 echo "API Proxy:    https://6792-${PROJECT_ID}.e2b.app" | tee -a "$LOG_FILE"
-echo "Logs:         /vibe0/convex_logs.txt"             | tee -a "$LOG_FILE"
+echo "Logs:         /glycer/convex_logs.txt"             | tee -a "$LOG_FILE"
 echo "=========================================="  | tee -a "$LOG_FILE"
 
 # Wait for processes

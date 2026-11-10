@@ -1,6 +1,6 @@
 #!/bin/bash
 # Prisma Studio starter script with auto-restart
-# Logs are saved to /vibe0/prisma_logs.txt
+# Logs are saved to /glycer/prisma_logs.txt
 # Runs Prisma Studio on port 5555
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
