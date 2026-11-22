@@ -2,8 +2,10 @@
 # Start dev server with env vars from .env.local exported to shell
 # This ensures EXPO_PUBLIC_* vars are baked into the bundle
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+# Trusted helpers are immutable; application state is always in the workspace.
+SCRIPT_DIR="/opt/glycer-runtime/scripts"
+PROJECT_DIR="/glycer"
+cd "$PROJECT_DIR" || exit 1
 
 # Source .env.local and export all EXPO_PUBLIC_* vars
 if [ -f "$PROJECT_DIR/.env.local" ]; then
@@ -11,8 +13,6 @@ if [ -f "$PROJECT_DIR/.env.local" ]; then
   set -a  # Auto-export all variables
   source "$PROJECT_DIR/.env.local"
   set +a
-  echo "EXPO_PUBLIC_PROJECT_ID=$EXPO_PUBLIC_PROJECT_ID"
-  echo "EXPO_PUBLIC_SESSION_TOKEN=${EXPO_PUBLIC_SESSION_TOKEN:0:10}..."
 fi
 
 # Start the dev server
@@ -34,4 +34,4 @@ socket.setTimeout(1500, () => { socket.destroy(); process.exit(1); });
   exit 0
 fi
 
-exec node scripts/start-tunnel.mjs "$@"
+exec node "$SCRIPT_DIR/start-tunnel.mjs" "$@"

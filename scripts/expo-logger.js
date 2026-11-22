@@ -1,93 +1,65 @@
 #!/usr/bin/env node
-/**
- * Expo Logger - Wraps expo commands and saves all output to expo_logs.txt
- * Also saves bundle-specific logs to bundle.txt for debugging bundle times
- * Usage: node scripts/expo-logger.js [expo args...]
- */
+/** Wrap the installed workspace Expo CLI; never resolve or fetch via npx. */
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+const { createInterface } = require('node:readline');
 
-const { spawn } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-
-const logFile = path.join(process.cwd(), 'expo_logs.txt');
-const bundleLogFile = path.join(process.cwd(), 'bundle.txt');
+const projectDir = '/glycer';
+process.chdir(projectDir);
+const logFile = path.join(projectDir, 'expo_logs.txt');
+const bundleLogFile = path.join(projectDir, 'bundle.txt');
 const args = process.argv.slice(2);
+const expoCli = path.join(projectDir, 'node_modules', 'expo', 'bin', 'cli');
+if (!fs.existsSync(expoCli)) {
+  console.error('[expo] Installed workspace Expo CLI is missing. Startup stopped.');
+  process.exit(1);
+}
 
-// Create/clear log files with timestamp header
+// Redact credentials even when a child splits them across output chunks.
+const secrets = Object.entries(process.env)
+  .filter(([key, value]) => /TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY/i.test(key) && value)
+  .map(([, value]) => value).sort((a, b) => b.length - a.length);
+const redact = text => secrets.reduce((result, secret) => result.split(secret).join('[REDACTED]'), text);
 const startTime = new Date().toISOString();
 fs.writeFileSync(logFile, `=== Expo Dev Server Started: ${startTime} ===\n\n`);
 fs.writeFileSync(bundleLogFile, `=== Bundle Log Started: ${startTime} ===\n\n`);
-
 const logStream = fs.createWriteStream(logFile, { flags: 'a' });
 const bundleStream = fs.createWriteStream(bundleLogFile, { flags: 'a' });
+const bundlePattern = /bundle|transform|compil|build|cache|\d+ms|\d+s|loading|ready|error|warning|ios|android|web/i;
 
-// Bundle-related patterns to capture
-const bundlePatterns = [
-  /bundle/i,
-  /transform/i,
-  /compil/i,
-  /build/i,
-  /cache/i,
-  /\d+ms/,
-  /\d+s/,
-  /loading/i,
-  /ready/i,
-  /error/i,
-  /warning/i,
-  /ios/i,
-  /android/i,
-  /web/i,
-];
-
-function isBundleRelated(text) {
-  return bundlePatterns.some(pattern => pattern.test(text));
+const env = { ...process.env };
+// The tunnel credential belongs to the trusted launcher, not the application.
+delete env.TUNNEL_TOKEN;
+const expo = spawn(process.execPath, [expoCli, ...args], {
+  cwd: projectDir, env, stdio: ['inherit', 'pipe', 'pipe'], shell: false,
+});
+for (const [stream, output, label] of [[expo.stdout, process.stdout, ''], [expo.stderr, process.stderr, '[ERR] ']]) {
+  const lines = createInterface({ input: stream, crlfDelay: Infinity });
+  lines.on('line', line => {
+    const text = redact(line) + '\n';
+    output.write(text);
+    logStream.write(text);
+    if (bundlePattern.test(text)) {
+      const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
+      bundleStream.write(`[${timestamp}] ${label}${text}`);
+    }
+  });
 }
-
-// Spawn expo with all passed arguments
-const expo = spawn('npx', ['expo', ...args], {
-  stdio: ['inherit', 'pipe', 'pipe'],
-  shell: true,
-});
-
-// Pipe stdout to both console and log files
-expo.stdout.on('data', (data) => {
-  const text = data.toString();
-  process.stdout.write(data);
-  logStream.write(data);
-
-  // Also write to bundle.txt if it's bundle-related
-  if (isBundleRelated(text)) {
-    const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
-    bundleStream.write(`[${timestamp}] ${text}`);
-  }
-});
-
-// Pipe stderr to both console and log files
-expo.stderr.on('data', (data) => {
-  const text = data.toString();
-  process.stderr.write(data);
-  logStream.write(data);
-
-  // Also write to bundle.txt if it's bundle-related
-  if (isBundleRelated(text)) {
-    const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
-    bundleStream.write(`[${timestamp}] [ERR] ${text}`);
-  }
-});
-
-expo.on('close', (code) => {
+let finished = false;
+function finish(code) {
+  if (finished) return;
+  finished = true;
   const endTime = new Date().toISOString();
-  logStream.write(`\n=== Expo Dev Server Stopped: ${endTime} (exit code: ${code}) ===\n`);
-  bundleStream.write(`\n=== Bundle Log Ended: ${endTime} ===\n`);
-  logStream.end();
-  bundleStream.end();
-  process.exit(code);
+  logStream.end(`\n=== Expo Dev Server Stopped: ${endTime} (exit code: ${code}) ===\n`);
+  bundleStream.end(`\n=== Bundle Log Ended: ${endTime} ===\n`);
+  // Let both file streams flush before exiting.
+  process.exitCode = code;
+}
+expo.on('close', code => finish(code === null ? 1 : code));
+expo.on('error', () => {
+  console.error('[expo] Could not execute installed Expo CLI.');
+  finish(1);
 });
-
-expo.on('error', (err) => {
-  logStream.write(`\n=== Error: ${err.message} ===\n`);
-  bundleStream.write(`\n=== Error: ${err.message} ===\n`);
-  logStream.end();
-  bundleStream.end();
-  process.exit(1);
-});
+process.on('SIGINT', () => expo.kill('SIGINT'));
+process.on('SIGTERM', () => expo.kill('SIGTERM'));

@@ -1,22 +1,24 @@
 /*
 IMPORTANT NOTICE: DO NOT REMOVE OR MODIFY
-This is the API client for the Multi-API proxy running on port 4000.
-In the E2B sandbox, this proxy routes to OpenAI, Anthropic, and Grok APIs.
+This is the client for the Glycer inference gateway (the Glycer server).
 
-The proxy automatically detects which API to use based on:
-- /v1/messages → Anthropic
-- /v1/chat/completions with model containing "grok" → Grok
-- /v1/chat/completions (default) → OpenAI
-- /v1/images/generations → OpenAI (GPT Image)
-
-All requests require the x-session-token header for authentication.
+How the gateway works:
+- The app sends inference requests to the gateway over https; the gateway
+  resolves which upstream provider and model to use on the server, from the
+  session owner's connections. Resolution happens entirely server-side.
+- Requests authenticate with a single scoped session token (x-session-token).
+  That token grants inference access only; it is not a user credential.
+- There are NO API keys in this app. No provider key is ever sent to or
+  stored in the sandbox.
+- Only two endpoints exist: /v1/chat/completions and /v1/images/generations.
+  Streaming is not supported, so requests receive the whole response at once.
 
 Configuration comes from .env.local via process.env.
 NEVER use localhost - the app runs on the user's phone.
 */
 
 import {
-  getProxyBaseUrl,
+  getGatewayBaseUrl,
   getSessionToken,
 } from './sandbox-config';
 
@@ -34,11 +36,11 @@ export const getAPIClient = (): APIClient => {
     return cachedClient;
   }
 
-  const baseUrl = getProxyBaseUrl();
+  const baseUrl = getGatewayBaseUrl();
   const sessionToken = getSessionToken();
 
   if (!sessionToken) {
-    console.warn('EXPO_PUBLIC_SESSION_TOKEN not set - API calls will fail');
+    console.warn('EXPO_PUBLIC_SESSION_TOKEN not set - AI gateway calls will fail');
   }
 
   cachedClient = {
@@ -56,6 +58,3 @@ export const getAPIClient = (): APIClient => {
 export const clearAPIClientCache = () => {
   cachedClient = null;
 };
-
-// Alias for backwards compatibility
-export const getOpenRouterClient = getAPIClient;

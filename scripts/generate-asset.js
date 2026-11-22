@@ -1,12 +1,19 @@
 #!/usr/bin/env node
 /*
-Asset Generation CLI for Claude/AI Agents
-Uses the Multi-API proxy (port 4000) for GPT Image 1.5 generation.
+Asset Generation CLI for AI Agents
+Generates images through the Glycer AI gateway (/v1/images/generations).
+
+The gateway resolves the image provider on the server from the session owner's
+connections. No API key is stored here: requests only carry the scoped session
+token. There is no image-editing endpoint, so only text-to-image is supported.
+
+Configuration (read from the environment, or from .env.local in the project root):
+  EXPO_PUBLIC_AI_GATEWAY_URL   Gateway base URL (defaults to the production gateway)
+  EXPO_PUBLIC_SESSION_TOKEN    Scoped inference token sent as x-session-token
 
 Usage:
   node scripts/generate-asset.js --prompt "a cute cat" --output ./assets/cat.png
   node scripts/generate-asset.js --prompt "app icon for a fitness app" --output ./assets/icon.png --size 1024x1024 --background transparent
-  node scripts/generate-asset.js --edit ./assets/logo.png --prompt "make it blue" --output ./assets/logo-blue.png
 
 Options:
   --prompt TEXT       Description of the image to generate (required)
@@ -15,7 +22,6 @@ Options:
   --quality QUALITY   Quality: low, medium, high, auto (default: auto)
   --background BG     Background: transparent, opaque, auto (default: opaque)
   --format FORMAT     Output format: png, jpeg, webp (default: png)
-  --edit PATH         Path to image to edit (for image editing mode)
   --n COUNT           Number of images to generate (default: 1)
 
 For long-running generation, use with nohup:
@@ -27,15 +33,14 @@ Examples:
 
   # Generate a splash screen
   node scripts/generate-asset.js --prompt "gradient background with subtle geometric patterns for meditation app" --output ./assets/splash.png --size 1024x1536
-
-  # Edit an existing image
-  node scripts/generate-asset.js --edit ./assets/logo.png --prompt "change the color to blue and add a subtle glow" --output ./assets/logo-v2.png
 */
 
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const https = require('https');
+
+const DEFAULT_GATEWAY_URL = 'https://glycer.flyingdarkdev.com/api/gateway';
 
 // Parse command line arguments
 function parseArgs() {
@@ -100,7 +105,7 @@ function parseArgs() {
 
 function printHelp() {
   console.log(`
-Asset Generation CLI for AI Agents
+Asset Generation CLI for AI Agents (Glycer AI gateway)
 
 Usage:
   node scripts/generate-asset.js --prompt "description" --output ./path/to/output.png
@@ -112,8 +117,13 @@ Options:
   --quality QUALITY   Quality: low, medium, high, auto (default: auto)
   --background BG     Background: transparent, opaque, auto (default: opaque)
   --format FORMAT     Output format: png, jpeg, webp (default: png)
-  --edit PATH         Path to image to edit (for image editing mode)
   --n COUNT           Number of images to generate (default: 1)
+
+Configuration is read from the environment or from .env.local in the project root:
+  EXPO_PUBLIC_AI_GATEWAY_URL   (default: ${DEFAULT_GATEWAY_URL})
+  EXPO_PUBLIC_SESSION_TOKEN    Scoped inference token (sent as x-session-token)
+
+Note: image editing is not supported - the gateway exposes only text-to-image.
 
 Examples:
   # Generate an app icon
@@ -121,59 +131,46 @@ Examples:
 
   # Generate with transparent background
   node scripts/generate-asset.js --prompt "logo on transparent" --output ./assets/logo.png --background transparent
-
-  # Edit an existing image
-  node scripts/generate-asset.js --edit ./assets/old.png --prompt "make it blue" --output ./assets/new.png
 `);
 }
 
-// Get session token from environment or file
+// Read a single variable from an env file (KEY=value), if present.
+function readEnvFile(name) {
+  for (const file of ['.env.local', '.expo_env']) {
+    try {
+      const content = fs.readFileSync(path.join(process.cwd(), file), 'utf8');
+      const match = content.match(new RegExp(`${name}=(.+)`));
+      if (match) return match[1].trim();
+    } catch (e) {
+      // File doesn't exist, that's fine
+    }
+  }
+  return null;
+}
+
+// Environment variable first, then .env.local / .expo_env.
+function readEnv(name) {
+  return process.env[name] || readEnvFile(name);
+}
+
+// Get the scoped session token for gateway authentication.
 function getSessionToken() {
-  // Check environment variable first
-  if (process.env.EXPO_PUBLIC_SESSION_TOKEN) {
-    return process.env.EXPO_PUBLIC_SESSION_TOKEN;
+  const token = readEnv('EXPO_PUBLIC_SESSION_TOKEN');
+  if (!token) {
+    console.error('Error: No session token found. Set EXPO_PUBLIC_SESSION_TOKEN in .env.local.');
+    process.exit(1);
   }
-
-  // Try to read from .env.local
-  try {
-    const envPath = path.join(process.cwd(), '.env.local');
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    const match = envContent.match(/EXPO_PUBLIC_SESSION_TOKEN=(.+)/);
-    if (match) {
-      return match[1].trim();
-    }
-  } catch (e) {
-    // File doesn't exist, that's fine
-  }
-
-  // Try .expo_env file
-  try {
-    const envPath = path.join(process.cwd(), '.expo_env');
-    const envContent = fs.readFileSync(envPath, 'utf8');
-    const match = envContent.match(/EXPO_PUBLIC_SESSION_TOKEN=(.+)/);
-    if (match) {
-      return match[1].trim();
-    }
-  } catch (e) {
-    // File doesn't exist, that's fine
-  }
-
-  console.error('Error: No session token found. Set EXPO_PUBLIC_SESSION_TOKEN environment variable.');
-  process.exit(1);
+  return token;
 }
 
-// Get base URL for the proxy
+// Gateway base URL: env value or the production default. Never localhost.
 function getBaseUrl() {
-  const projectId = process.env.EXPO_PUBLIC_PROJECT_ID || '';
-
-  if (projectId && projectId !== 'local') {
-    return `https://4000-${projectId}.e2b.app`;
-  }
-
-  return 'http://localhost:4000';
+  const configured = readEnv('EXPO_PUBLIC_AI_GATEWAY_URL');
+  if (configured) return configured.replace(/\/+$/, '');
+  return DEFAULT_GATEWAY_URL;
 }
 
-// Make HTTP request to the proxy
+// Make an HTTP(S) request; resolves with { status, data } for any status.
 function makeRequest(url, options, body) {
   return new Promise((resolve, reject) => {
     const isHttps = url.startsWith('https');
@@ -182,13 +179,7 @@ function makeRequest(url, options, body) {
     const req = httpModule.request(url, options, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        if (res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-        } else {
-          resolve({ status: res.statusCode, data });
-        }
-      });
+      res.on('end', () => resolve({ status: res.statusCode, data }));
     });
 
     req.on('error', reject);
@@ -204,13 +195,24 @@ function makeRequest(url, options, body) {
   });
 }
 
-// Generate image using GPT Image 1.5
+// Extract a friendly message from a gateway error body ({ error, code }).
+function gatewayErrorMessage(status, raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.error) return parsed.error;
+  } catch (e) {
+    // Not JSON; fall through to the status text.
+  }
+  return `Gateway request failed (HTTP ${status}): ${raw}`;
+}
+
+// Generate images via the gateway (/v1/images/generations). The model is omitted
+// so the server default is used.
 async function generateImage(options) {
   const baseUrl = getBaseUrl();
   const sessionToken = getSessionToken();
 
   const requestBody = {
-    model: 'gpt-image-1.5',
     prompt: options.prompt,
     n: options.n,
     size: options.size,
@@ -230,72 +232,14 @@ async function generateImage(options) {
     },
   }, JSON.stringify(requestBody));
 
-  const result = JSON.parse(response.data);
-
-  if (result.error) {
-    throw new Error(result.error.message || 'Image generation failed');
+  if (response.status >= 400) {
+    throw new Error(gatewayErrorMessage(response.status, response.data));
   }
-
-  return result.data;
-}
-
-// Edit existing image using GPT Image 1.5
-async function editImage(options) {
-  const baseUrl = getBaseUrl();
-  const sessionToken = getSessionToken();
-
-  // Read the source image
-  const imagePath = path.resolve(options.edit);
-  if (!fs.existsSync(imagePath)) {
-    throw new Error(`Source image not found: ${imagePath}`);
-  }
-
-  const imageBuffer = fs.readFileSync(imagePath);
-  const imageBase64 = imageBuffer.toString('base64');
-
-  // For multipart/form-data we need to build the boundary manually
-  const boundary = '----FormBoundary' + Math.random().toString(36).substring(2);
-
-  let formBody = '';
-  formBody += `--${boundary}\r\n`;
-  formBody += `Content-Disposition: form-data; name="image"; filename="image.png"\r\n`;
-  formBody += `Content-Type: image/png\r\n\r\n`;
-
-  const formStart = Buffer.from(formBody);
-  const imageData = Buffer.from(imageBase64, 'base64');
-
-  let formEnd = `\r\n--${boundary}\r\n`;
-  formEnd += `Content-Disposition: form-data; name="model"\r\n\r\ngpt-image-1.5\r\n`;
-  formEnd += `--${boundary}\r\n`;
-  formEnd += `Content-Disposition: form-data; name="prompt"\r\n\r\n${options.prompt}\r\n`;
-  formEnd += `--${boundary}\r\n`;
-  formEnd += `Content-Disposition: form-data; name="n"\r\n\r\n${options.n}\r\n`;
-  formEnd += `--${boundary}\r\n`;
-  formEnd += `Content-Disposition: form-data; name="size"\r\n\r\n${options.size}\r\n`;
-  formEnd += `--${boundary}\r\n`;
-  formEnd += `Content-Disposition: form-data; name="quality"\r\n\r\n${options.quality}\r\n`;
-  formEnd += `--${boundary}--\r\n`;
-
-  const formEndBuffer = Buffer.from(formEnd);
-  const body = Buffer.concat([formStart, imageData, formEndBuffer]);
-
-  console.log(`Editing image: ${options.edit}`);
-  console.log(`Prompt: "${options.prompt.substring(0, 50)}..."`);
-
-  const response = await makeRequest(`${baseUrl}/v1/images/edits`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': `multipart/form-data; boundary=${boundary}`,
-      'x-session-token': sessionToken,
-    },
-  }, body);
 
   const result = JSON.parse(response.data);
-
-  if (result.error) {
-    throw new Error(result.error.message || 'Image editing failed');
+  if (!result || !Array.isArray(result.data)) {
+    throw new Error('The gateway returned no image data.');
   }
-
   return result.data;
 }
 
@@ -313,8 +257,7 @@ function saveImage(imageData, outputPath, format) {
   if (imageData.b64_json) {
     buffer = Buffer.from(imageData.b64_json, 'base64');
   } else if (imageData.url) {
-    // If we got a URL, we'd need to download it
-    // For now, we expect b64_json from GPT Image
+    // The gateway returns base64 (b64_json); a URL is unexpected but noted.
     console.log(`Image URL: ${imageData.url}`);
     console.log('Note: URL returned instead of base64. Download manually if needed.');
     return;
@@ -333,6 +276,12 @@ function saveImage(imageData, outputPath, format) {
 // Main function
 async function main() {
   const options = parseArgs();
+
+  // Image editing is not supported by the gateway.
+  if (options.edit) {
+    console.error('Error: image editing is not supported. The Glycer AI gateway exposes only text-to-image generation.');
+    process.exit(1);
+  }
 
   // Validate required options
   if (!options.prompt) {
@@ -373,15 +322,7 @@ async function main() {
   }
 
   try {
-    let results;
-
-    if (options.edit) {
-      // Edit mode
-      results = await editImage(options);
-    } else {
-      // Generate mode
-      results = await generateImage(options);
-    }
+    const results = await generateImage(options);
 
     // Save the generated images
     for (let i = 0; i < results.length; i++) {

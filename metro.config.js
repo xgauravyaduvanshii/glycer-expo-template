@@ -43,10 +43,6 @@ module.exports = {
   // File watching configuration
   watcher: {
     ...defaultConfig.watcher,
-    // Try watchman first (faster), fall back to polling if it fails
-    // Watchman is installed in the Docker container
-    watchman: true,
-    // If watchman fails, use polling with a reasonable interval
     additionalExts: defaultConfig.watcher?.additionalExts || [],
   },
   // Server configuration
@@ -77,6 +73,8 @@ module.exports = {
   // Resolver optimizations
   resolver: {
     ...defaultConfig.resolver,
+    // Supported Metro option: use Node crawling/watching without Watchman.
+    useWatchman: false,
     // Cache resolution results
     hasteImplModulePath: undefined,
   },

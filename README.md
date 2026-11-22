@@ -17,7 +17,7 @@
 
 ## ✨ Features
 
-- 🤖 **Multi-Provider AI Integration** — OpenAI (GPT-5), Anthropic (Claude 4.5), Grok 4 with streaming support
+- 🤖 **Gateway-backed AI** — text and image generation through the Glycer inference gateway; the app never holds a provider key
 - 🎨 **AI Image Generation** — GPT Image 1.5 with text-to-image, image editing, and multiple sizes/formats
 - ⚡ **Real-time Backend** — Hono + tRPC server with Convex for real-time data
 - 🗄️ **Database ORM** — Prisma with full migration support
@@ -71,7 +71,7 @@ EXPO_PUBLIC_SESSION_TOKEN=your_session_token_here
 EAS_PROJECT_ID=your_eas_project_id
 ```
 
-> **Note:** `EXPO_PUBLIC_PROJECT_ID` is used to construct the proxy URLs for AI APIs and the backend. Never use `localhost` — the app runs on the user's physical device.
+> **Note:** `EXPO_PUBLIC_PROJECT_ID` identifies the sandbox whose session token authorises gateway and backend calls. Never use `localhost` — the app runs on the user's physical device.
 
 ### 4. Start the Development Server
 
@@ -98,9 +98,9 @@ glycer-expo-template/
 │
 ├── lib/
 │   ├── ai/
-│   │   ├── chat-service.ts     # Multi-provider AI chat (OpenAI / Anthropic / Grok)
-│   │   ├── asset-generation.ts # Image generation & editing (GPT Image 1.5)
-│   │   ├── openrouter.ts       # Unified API client
+│   │   ├── chat-service.ts     # Text chat helpers (calls the gateway)
+│   │   ├── asset-generation.ts # Image generation helpers (calls the gateway)
+│   │   ├── gateway-client.ts   # Gateway HTTP client + session-token auth
 │   │   └── sandbox-config.ts   # E2B sandbox environment config
 │   └── types/
 │       └── ai.ts               # Shared AI TypeScript types
@@ -134,62 +134,45 @@ glycer-expo-template/
 
 ## 🤖 AI Services
 
-This template includes a **Multi-Provider AI Proxy** that routes requests to OpenAI, Anthropic, or Grok based on the endpoint called.
+All AI calls go to the **Glycer inference gateway**. The gateway decides which upstream provider and model serve a request, based on the provider connections the session owner configured in Glycer — the app itself holds no provider credentials.
 
-### Proxy Routing
+### Endpoints
 
-| Endpoint | Provider |
+| Endpoint | Purpose |
 |----------|---------|
-| `POST /v1/chat/completions` | OpenAI (default) |
-| `POST /v1/chat/completions` (grok model) | Grok |
-| `POST /v1/messages` | Anthropic |
-| `POST /v1/images/generations` | OpenAI GPT Image |
+| `POST /v1/chat/completions` | Text generation |
+| `POST /v1/images/generations` | Image generation |
 
-### Available Models
+Requests carry `x-session-token: <EXPO_PUBLIC_SESSION_TOKEN>` and target `<EXPO_PUBLIC_AI_GATEWAY_URL>` (falls back to the deployed `/api/gateway`). That token is scoped to one sandbox and grants inference access only. Responses arrive complete — the gateway does not stream.
 
-**OpenAI**
-- `gpt-5-2025-08-07` _(default, vision support)_
-- `gpt-5.2`, `gpt-4o`, `gpt-4o-mini`
+### Choosing a model
 
-**Anthropic**
-- `claude-sonnet-4-5-20250929` _(default)_
-- `claude-haiku-4-5-20251001`, `claude-opus-4-5-20251101`
-
-**Grok (xAI)**
-- `grok-4-latest` _(default)_
-- `grok-4.1-fast`
+Leave `model` unset to use the owner's default for that purpose, or pass a selection of the form `<connectionId>::<modelId>` copied from the Glycer provider settings. A raw provider model name (`gpt-…`, `claude-…`, `gemini-…`) is rejected with `invalid_model_selection`, because the app cannot name an upstream provider directly.
 
 ### Chat Service Usage
 
 ```typescript
 import {
-  // Streaming
-  streamOpenAIChat,
-  streamAnthropicChat,
-  streamGrokChat,
-  // Non-Streaming
-  getOpenAITextResponse,
-  getAnthropicTextResponse,
-  getGrokTextResponse,
+  generateChatText,
+  generateTextResponse,
+  generateStructuredText,
 } from '@/lib/ai/chat-service';
-import type { AIMessage } from '@/lib/types/ai';
+import type { ChatMessage } from '@/lib/ai/chat-service';
 
-// Streaming example
-const messages: AIMessage[] = [
-  { role: 'user', content: 'Hello! Tell me about React Native.' }
+const messages: ChatMessage[] = [
+  { role: 'user', content: 'Hello! Tell me about React Native.' },
 ];
 
-await streamOpenAIChat(messages, (chunk, done) => {
-  if (!done) console.log(chunk);
-  else console.log('Stream complete!');
-});
+const { content, usage } = await generateChatText(messages, { maxTokens: 2048 });
+console.log(content, usage?.total_tokens);
 
-// Non-streaming example
-const response = await getAnthropicTextResponse(messages, {
-  model: 'claude-sonnet-4-5-20250929',
-  maxTokens: 2048,
-});
-console.log(response.content);
+// Single-prompt convenience wrapper
+const reply = await generateTextResponse('Summarise this app in one sentence.');
+
+// JSON only — throws if the model never returns valid JSON; validate with zod
+const stats = await generateStructuredText<{ rows: number }>(
+  'Return { "rows": 5 }.',
+);
 ```
 
 ### Image Generation Usage
@@ -198,25 +181,27 @@ console.log(response.content);
 import {
   generateImage,
   generateImageAsDataUrl,
-  editImage,
+  aspectRatioToSize,
 } from '@/lib/ai/asset-generation';
 
-// Generate an image
+// Generate an image (returns base64 results)
 const images = await generateImage('A futuristic city at sunset', {
   size: '1536x1024',
   quality: 'high',
   outputFormat: 'png',
 });
 
-// Get as a data URL (ready for <Image> component)
+// Ready for an <Image> source
 const dataUrl = await generateImageAsDataUrl('A cute robot waving', {
   size: '1024x1024',
   background: 'transparent',
 });
 
-// Edit an existing image
-const edited = await editImage(base64ImageString, 'Add a rainbow in the sky');
+// Map a layout ratio onto a supported size
+const size = aspectRatioToSize('16:9');
 ```
+
+There is no image-editing endpoint; every image starts from a text prompt.
 
 ---
 
@@ -296,7 +281,7 @@ Access via: `https://5000-{PROJECT_ID}.e2b.app`
 | **Real-time** | Convex |
 | **Database** | Prisma 6 |
 | **Package Manager** | Bun |
-| **AI** | OpenAI, Anthropic, Grok via unified proxy |
+| **AI** | Glycer inference gateway (server-resolved providers) |
 | **Navigation** | React Navigation 7 |
 | **Animations** | React Native Reanimated 4 |
 | **Icons** | Lucide React Native, Expo Vector Icons |
@@ -329,7 +314,7 @@ Path aliases are configured:
 
 > **Session Token** — All API requests require the `x-session-token` header set via `EXPO_PUBLIC_SESSION_TOKEN`.
 
-> **Reasoning Models** — Some OpenAI reasoning models do not support `temperature` or `max_tokens`. This template uses `max_completion_tokens` and omits temperature for maximum compatibility.
+> **Sampling parameters** — `temperature` and `max_tokens` are forwarded only when you set them. Some upstream models reject one or both, so omit them unless you need deterministic control.
 
 ---
 

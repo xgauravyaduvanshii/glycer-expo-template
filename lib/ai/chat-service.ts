@@ -1,397 +1,152 @@
 /*
 IMPORTANT NOTICE: DO NOT REMOVE
 ./lib/ai/chat-service.ts
-AI Chat Service for text generation, image analysis, and streaming.
-Uses the Multi-API proxy (port 4000) which routes to OpenAI, Anthropic, or Grok.
+Provider-neutral chat helper for the Glycer inference gateway.
 
-Available Models:
-- OpenAI: gpt-5-2025-08-07 (default), gpt-5.2, gpt-4o, gpt-4o-mini (supports images)
-- Anthropic: claude-sonnet-4-5-20250929 (default), claude-haiku-4-5-20251001, claude-opus-4-5-20251101
-- Grok: grok-4-latest (default), grok-4.1-fast
+The gateway resolves the upstream provider and model on the server from the
+session owner's connections. This module never names a provider and never holds
+an API key; it only posts to the gateway's /v1/chat/completions endpoint with
+the scoped session token. Streaming is not supported - responses arrive whole.
 
-Streaming Support:
-- Use streamOpenAIChat, streamAnthropicChat, or streamGrokChat for streaming responses
-- Uses expo/fetch for WinterCG-compliant streaming across web and mobile
+Model selection is optional. Omit `model` to use the session owner's default
+chat model, or pass an exact selection string ("<connectionId>::<modelId>").
+
+For structured (JSON) output, validate the parsed value with zod in the app -
+generateStructuredText only guarantees the reply parsed as JSON, not its shape.
 */
 import { fetch } from "expo/fetch";
-import { AIMessage, AIRequestOptions, AIResponse } from "@/lib/types/ai";
-import { getAPIClient } from "@/lib/ai/openrouter";
+import { getAPIClient } from "@/lib/ai/gateway-client";
 
-type ChatResponse = {
-  id: string;
-  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
-  choices: Array<{ index: number; message: { role: string; content: string } }>;
+export type ChatRole = "system" | "user" | "assistant";
+export type ChatMessage = { role: ChatRole; content: string };
+
+export type ChatUsage = {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
 };
 
-type AnthropicResponse = {
-  id: string;
-  content: Array<{ type: string; text: string }>;
-  usage?: { input_tokens?: number; output_tokens?: number };
+export type ChatOptions = {
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  signal?: AbortSignal;
 };
 
-// Streaming callback type
-export type StreamCallback = (chunk: string, done: boolean) => void;
+type ChatCompletionResponse = {
+  id: string;
+  object: "chat.completion";
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    message: { role: "assistant"; content: string };
+    finish_reason: string;
+  }>;
+  usage?: ChatUsage;
+};
 
-// ============================================================================
-// Non-Streaming Functions
-// ============================================================================
+type GatewayErrorBody = { error?: string; code?: string };
 
 /**
- * Send a chat completion request to OpenAI-compatible endpoint
- *
- * IMPORTANT API COMPATIBILITY NOTES:
- * - Some models (like o1, reasoning models) do NOT support temperature parameter - only default (1) is allowed
- * - Some models require `max_completion_tokens` instead of `max_tokens`
- * - When in doubt, omit temperature and use max_completion_tokens for better compatibility
+ * POST a chat completion request to the gateway and return the parsed response.
+ * Gateway errors ({ error, code }) are surfaced verbatim so app code can show them.
  */
-async function postOpenAIChat(model: string, messages: AIMessage[], options?: AIRequestOptions): Promise<AIResponse> {
+async function requestChat(
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<ChatCompletionResponse> {
   const client = getAPIClient();
-  const modelName = options?.model || model;
-
-  // Build request body with only supported parameters
-  // NOTE: We use max_completion_tokens (newer API) instead of max_tokens for better compatibility
-  // NOTE: We omit temperature entirely as some models (reasoning models) only support default temperature
-  const requestBody: Record<string, unknown> = {
-    model: modelName,
-    messages,
-    max_completion_tokens: options?.maxTokens ?? 4096,
-  };
-
-  // Only add top_p if explicitly provided (some models may not support it)
-  if (options?.topP !== undefined) {
-    requestBody.top_p = options.topP;
-  }
 
   const res = await fetch(`${client.baseUrl}/v1/chat/completions`, {
     method: "POST",
     headers: client.headers,
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify(body),
+    signal,
   });
+
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`API error ${res.status}: ${text}`);
+    const detail = (await res.json().catch(() => null)) as GatewayErrorBody | null;
+    throw new Error(detail?.error || `The AI gateway request failed (status ${res.status}).`);
   }
-  const data = (await res.json()) as ChatResponse;
-  const content = data.choices[0]?.message?.content ?? "";
-  return {
-    content,
-    usage: {
-      promptTokens: data.usage?.prompt_tokens ?? 0,
-      completionTokens: data.usage?.completion_tokens ?? 0,
-      totalTokens: data.usage?.total_tokens ?? 0,
-    },
-  };
+
+  return (await res.json()) as ChatCompletionResponse;
 }
 
 /**
- * Send a message request to Anthropic endpoint
+ * Send a conversation to the gateway and return the assistant reply plus token usage.
+ * `model` is omitted unless the caller provides an explicit selection.
  */
-async function postAnthropicChat(model: string, messages: AIMessage[], options?: AIRequestOptions): Promise<AIResponse> {
-  const client = getAPIClient();
-  const res = await fetch(`${client.baseUrl}/v1/messages`, {
-    method: "POST",
-    headers: client.headers,
-    body: JSON.stringify({
-      model: options?.model || model,
-      messages,
-      max_tokens: options?.maxTokens ?? 4096,
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Anthropic API error ${res.status}: ${text}`);
-  }
-  const data = (await res.json()) as AnthropicResponse;
-  const content = data.content[0]?.text ?? "";
-  return {
-    content,
-    usage: {
-      promptTokens: data.usage?.input_tokens ?? 0,
-      completionTokens: data.usage?.output_tokens ?? 0,
-      totalTokens: (data.usage?.input_tokens ?? 0) + (data.usage?.output_tokens ?? 0),
-    },
-  };
+export async function generateChatText(
+  messages: ChatMessage[],
+  options?: ChatOptions
+): Promise<{ content: string; usage?: ChatUsage }> {
+  const body: Record<string, unknown> = { messages };
+  if (options?.model) body.model = options.model;
+  if (options?.temperature !== undefined) body.temperature = options.temperature;
+  if (options?.maxTokens !== undefined) body.max_tokens = options.maxTokens;
+
+  const data = await requestChat(body, options?.signal);
+  const content = data.choices?.[0]?.message?.content ?? "";
+  return { content, usage: data.usage };
 }
 
-// ============================================================================
-// Streaming Functions (using expo/fetch)
-// ============================================================================
+/**
+ * Convenience wrapper: send a single user message and get the text back.
+ */
+export async function generateTextResponse(
+  prompt: string,
+  options?: ChatOptions
+): Promise<{ content: string }> {
+  const { content } = await generateChatText([{ role: "user", content: prompt }], options);
+  return { content };
+}
 
 /**
- * Parse SSE (Server-Sent Events) data from a chunk
+ * Strip markdown code fences from a model reply so JSON.parse can run on it.
  */
-function parseSSEChunk(chunk: string): string[] {
-  const lines = chunk.split("\n");
-  const contents: string[] = [];
+function stripCodeFences(text: string): string {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1].trim() : trimmed;
+}
 
-  for (const line of lines) {
-    if (line.startsWith("data: ")) {
-      const data = line.slice(6);
-      if (data === "[DONE]") continue;
+/**
+ * Ask the model for JSON only and parse it into `T`, retrying once if the reply
+ * is not valid JSON (two attempts total). Validate the result with zod in the app.
+ * Throws a friendly error if the model never returns valid JSON.
+ */
+export async function generateStructuredText<T>(
+  prompt: string,
+  options?: { model?: string; instruction?: string }
+): Promise<T> {
+  const instruction =
+    options?.instruction ?? "Return only valid JSON that matches the requested shape.";
 
-      try {
-        const parsed = JSON.parse(data);
-        // OpenAI/Grok format
-        if (parsed.choices?.[0]?.delta?.content) {
-          contents.push(parsed.choices[0].delta.content);
-        }
-        // Anthropic format
-        if (parsed.type === "content_block_delta" && parsed.delta?.text) {
-          contents.push(parsed.delta.text);
-        }
-      } catch {
-        // Skip invalid JSON
-      }
+  const messages: ChatMessage[] = [
+    {
+      role: "system",
+      content: `You are a precise data assistant. ${instruction} Do not include prose, commentary, or markdown fences.`,
+    },
+    { role: "user", content: prompt },
+  ];
+
+  const maxAttempts = 2;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { content } = await generateChatText(messages, { model: options?.model });
+
+    try {
+      return JSON.parse(stripCodeFences(content)) as T;
+    } catch {
+      if (attempt === maxAttempts - 1) break;
+      // Nudge the model to correct itself on the retry.
+      messages.push({ role: "assistant", content });
+      messages.push({
+        role: "user",
+        content: "That response was not valid JSON. Reply again with only valid JSON.",
+      });
     }
   }
 
-  return contents;
+  throw new Error("The AI model did not return valid JSON. Please try rephrasing your request.");
 }
-
-/**
- * Stream chat completion from OpenAI-compatible endpoint
- * Uses expo/fetch for cross-platform streaming support
- *
- * IMPORTANT: Uses max_completion_tokens (not max_tokens) and omits temperature
- * for compatibility with reasoning models that don't support these parameters.
- */
-export async function streamOpenAIChat(
-  messages: AIMessage[],
-  onChunk: StreamCallback,
-  options?: AIRequestOptions
-): Promise<string> {
-  const client = getAPIClient();
-  const model = options?.model || "gpt-5-2025-08-07";
-
-  // Build request body - omit temperature for compatibility with reasoning models
-  const requestBody: Record<string, unknown> = {
-    model,
-    messages,
-    max_completion_tokens: options?.maxTokens ?? 4096,
-    stream: true,
-  };
-
-  if (options?.topP !== undefined) {
-    requestBody.top_p = options.topP;
-  }
-
-  const res = await fetch(`${client.baseUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      ...client.headers,
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify(requestBody),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`API error ${res.status}: ${text}`);
-  }
-
-  const reader = res.body?.getReader();
-  if (!reader) {
-    throw new Error("No response body");
-  }
-
-  const decoder = new TextDecoder();
-  let fullContent = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true });
-      const contents = parseSSEChunk(chunk);
-
-      for (const content of contents) {
-        fullContent += content;
-        onChunk(content, false);
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  onChunk("", true);
-  return fullContent;
-}
-
-/**
- * Stream chat completion from Anthropic endpoint
- * Uses expo/fetch for cross-platform streaming support
- */
-export async function streamAnthropicChat(
-  messages: AIMessage[],
-  onChunk: StreamCallback,
-  options?: AIRequestOptions
-): Promise<string> {
-  const client = getAPIClient();
-  const model = options?.model || "claude-sonnet-4-5-20250929";
-
-  const res = await fetch(`${client.baseUrl}/v1/messages`, {
-    method: "POST",
-    headers: {
-      ...client.headers,
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      max_tokens: options?.maxTokens ?? 4096,
-      stream: true,
-    }),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Anthropic API error ${res.status}: ${text}`);
-  }
-
-  const reader = res.body?.getReader();
-  if (!reader) {
-    throw new Error("No response body");
-  }
-
-  const decoder = new TextDecoder();
-  let fullContent = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true });
-      const contents = parseSSEChunk(chunk);
-
-      for (const content of contents) {
-        fullContent += content;
-        onChunk(content, false);
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  onChunk("", true);
-  return fullContent;
-}
-
-/**
- * Stream chat completion from Grok endpoint
- * Uses expo/fetch for cross-platform streaming support
- *
- * IMPORTANT: Uses max_completion_tokens (not max_tokens) and omits temperature
- * for compatibility with models that don't support these parameters.
- */
-export async function streamGrokChat(
-  messages: AIMessage[],
-  onChunk: StreamCallback,
-  options?: AIRequestOptions
-): Promise<string> {
-  const client = getAPIClient();
-  const model = options?.model || "grok-4-latest";
-
-  // Build request body - omit temperature for compatibility
-  const requestBody: Record<string, unknown> = {
-    model,
-    messages,
-    max_completion_tokens: options?.maxTokens ?? 4096,
-    stream: true,
-  };
-
-  if (options?.topP !== undefined) {
-    requestBody.top_p = options.topP;
-  }
-
-  const res = await fetch(`${client.baseUrl}/v1/chat/completions`, {
-    method: "POST",
-    headers: {
-      ...client.headers,
-      Accept: "text/event-stream",
-    },
-    body: JSON.stringify(requestBody),
-  });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`Grok API error ${res.status}: ${text}`);
-  }
-
-  const reader = res.body?.getReader();
-  if (!reader) {
-    throw new Error("No response body");
-  }
-
-  const decoder = new TextDecoder();
-  let fullContent = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      const chunk = decoder.decode(value, { stream: true });
-      const contents = parseSSEChunk(chunk);
-
-      for (const content of contents) {
-        fullContent += content;
-        onChunk(content, false);
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  onChunk("", true);
-  return fullContent;
-}
-
-// ============================================================================
-// OpenAI Functions (Non-Streaming)
-// ============================================================================
-
-export const getOpenAITextResponse = async (
-  messages: AIMessage[],
-  options?: AIRequestOptions
-): Promise<AIResponse> => {
-  const defaultModel = "gpt-5-2025-08-07"; // Latest GPT-5 with vision support
-  return postOpenAIChat(defaultModel, messages, options);
-};
-
-export const getOpenAIChatResponse = async (prompt: string): Promise<AIResponse> => {
-  return getOpenAITextResponse([{ role: "user", content: prompt }]);
-};
-
-// ============================================================================
-// Anthropic Functions (Non-Streaming)
-// ============================================================================
-
-export const getAnthropicTextResponse = async (
-  messages: AIMessage[],
-  options?: AIRequestOptions
-): Promise<AIResponse> => {
-  const defaultModel = "claude-sonnet-4-5-20250929"; // Latest Claude 4.5 Sonnet
-  return postAnthropicChat(defaultModel, messages, options);
-};
-
-export const getAnthropicChatResponse = async (prompt: string): Promise<AIResponse> => {
-  return getAnthropicTextResponse([{ role: "user", content: prompt }]);
-};
-
-// ============================================================================
-// Grok Functions (Non-Streaming)
-// ============================================================================
-
-export const getGrokTextResponse = async (
-  messages: AIMessage[],
-  options?: AIRequestOptions
-): Promise<AIResponse> => {
-  const defaultModel = "grok-4-latest"; // Latest Grok 4
-  return postOpenAIChat(defaultModel, messages, options);
-};
-
-export const getGrokChatResponse = async (prompt: string): Promise<AIResponse> => {
-  return getGrokTextResponse([{ role: "user", content: prompt }]);
-};

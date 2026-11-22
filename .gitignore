@@ -35,9 +35,10 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
-# Lock files
+# Retain the reviewed Bun lockfile for frozen sandbox image installs.
 *.lockb
 *.lock
+!bun.lock
 package-lock.json
 
 # Expo logs

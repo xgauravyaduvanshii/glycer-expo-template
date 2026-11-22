@@ -1,20 +1,21 @@
 /*
 IMPORTANT NOTICE: DO NOT REMOVE
 ./lib/ai/asset-generation.ts
-Asset Generation Service using GPT Image 1.5 API.
-Uses the Multi-API proxy (port 4000) for image generation.
+Image asset generation through the Glycer AI gateway.
 
-Features:
-- Generate images from text prompts
-- Edit existing images
-- Support for transparent backgrounds (PNG/WebP)
-- Multiple quality levels (low, medium, high, auto)
-- Various sizes (1024x1024, 1024x1536, 1536x1024)
+Assets are produced by the session owner's connected image provider, which the
+gateway resolves on the server. There is NO API key in this app: requests only
+carry the scoped session token to /v1/images/generations, and results come back
+as base64 (b64_json). No image-editing endpoint exists, so only text-to-image is
+supported here.
+
+Do not hardcode a model - omit it and the server default is used. Pass an exact
+selection string ("<connectionId>::<modelId>") only when the user chose one.
 
 For CLI usage, see: scripts/generate-asset.js
 */
 
-import { getAPIClient } from "@/lib/ai/openrouter";
+import { getAPIClient } from "@/lib/ai/gateway-client";
 
 export type ImageGenOptions = {
   model?: string;
@@ -31,29 +32,32 @@ export type ImageGenResult = {
   revised_prompt?: string;
 };
 
+type GatewayErrorBody = { error?: string; code?: string };
+
 /**
- * Generate images using GPT Image 1.5 API
- * Returns base64 data or URL depending on API response
+ * Generate images from a text prompt via the gateway's /v1/images/generations
+ * endpoint. Returns base64 results (b64_json). The `model` field is omitted
+ * unless the caller supplies an explicit selection so the server default applies.
  */
 export async function generateImage(
   prompt: string,
   options?: ImageGenOptions
 ): Promise<ImageGenResult[]> {
   const client = getAPIClient();
-  const model = options?.model || "gpt-image-1.5";
 
   const body: Record<string, unknown> = {
-    model,
     prompt,
-    n: options?.n || 1,
-    size: options?.size || "1024x1024",
-    quality: options?.quality || "auto",
-    background: options?.background || "opaque",
+    n: options?.n ?? 1,
+    size: options?.size ?? "1024x1024",
+    quality: options?.quality ?? "auto",
+    background: options?.background ?? "opaque",
+    output_format: options?.outputFormat ?? "png",
   };
 
-  // Add output format for GPT Image models
-  if (model.startsWith("gpt-image")) {
-    body.output_format = options?.outputFormat || "png";
+  // Only forward a model when the user explicitly selected one; otherwise the
+  // gateway uses the session owner's default image model.
+  if (options?.model) {
+    body.model = options.model;
   }
 
   const res = await fetch(`${client.baseUrl}/v1/images/generations`, {
@@ -63,8 +67,8 @@ export async function generateImage(
   });
 
   if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Image generation error ${res.status}: ${txt}`);
+    const detail = (await res.json().catch(() => null)) as GatewayErrorBody | null;
+    throw new Error(detail?.error || `Image generation failed (status ${res.status}).`);
   }
 
   const data = (await res.json()) as { data: ImageGenResult[] };
@@ -72,7 +76,7 @@ export async function generateImage(
 }
 
 /**
- * Generate a single image and return as base64 data URL
+ * Generate a single image and return it as a base64 data URL.
  */
 export async function generateImageAsDataUrl(
   prompt: string,
@@ -81,12 +85,12 @@ export async function generateImageAsDataUrl(
   const results = await generateImage(prompt, { ...options, n: 1 });
   const result = results[0];
 
-  if (result.b64_json) {
+  if (result?.b64_json) {
     const format = options?.outputFormat || "png";
     return `data:image/${format};base64,${result.b64_json}`;
   }
 
-  if (result.url) {
+  if (result?.url) {
     return result.url;
   }
 
@@ -94,56 +98,7 @@ export async function generateImageAsDataUrl(
 }
 
 /**
- * Edit an existing image using GPT Image API
- * @param imageBase64 - Base64 encoded image data (without data URL prefix)
- * @param prompt - Description of the edit to make
- */
-export async function editImage(
-  imageBase64: string,
-  prompt: string,
-  options?: ImageGenOptions
-): Promise<ImageGenResult[]> {
-  const client = getAPIClient();
-  const model = options?.model || "gpt-image-1.5";
-
-  // For edits endpoint, we need to use FormData
-  const formData = new FormData();
-
-  // Convert base64 to blob
-  const byteCharacters = atob(imageBase64);
-  const byteNumbers = new Array(byteCharacters.length);
-  for (let i = 0; i < byteCharacters.length; i++) {
-    byteNumbers[i] = byteCharacters.charCodeAt(i);
-  }
-  const byteArray = new Uint8Array(byteNumbers);
-  const blob = new Blob([byteArray], { type: "image/png" });
-
-  formData.append("image", blob, "image.png");
-  formData.append("model", model);
-  formData.append("prompt", prompt);
-  formData.append("n", String(options?.n || 1));
-  formData.append("size", options?.size || "1024x1024");
-  formData.append("quality", options?.quality || "auto");
-
-  const res = await fetch(`${client.baseUrl}/v1/images/edits`, {
-    method: "POST",
-    headers: {
-      "x-session-token": client.headers["x-session-token"],
-    },
-    body: formData,
-  });
-
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Image edit error ${res.status}: ${txt}`);
-  }
-
-  const data = (await res.json()) as { data: ImageGenResult[] };
-  return data.data;
-}
-
-/**
- * Helper to convert aspect ratio string to size
+ * Helper to convert an aspect ratio string to a gateway size value.
  */
 export function aspectRatioToSize(
   aspectRatio: string
